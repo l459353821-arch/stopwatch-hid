@@ -1,0 +1,35 @@
+# PlatformIO / build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+build/
+managed_components/
+
+# Compiled binaries / firmware images
+*.bin
+*.elf
+*.hex
+*.map
+*.factory.bin
+
+# ESP-IDF generated files
+sdkconfig
+sdkconfig.old
+sdkconfig.*.old
+sdkconfig.defaults
+
+# Local flash scripts (Mac-specific, hardcoded paths)
+flash.command
+flash-fixed.sh
+
+# Dummy build helpers
+.dummy/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
