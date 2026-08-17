@@ -36,6 +36,9 @@ constexpr uint32_t kBlueRepeatMs     = 100;  // 蓝色长按连删间隔
 constexpr uint32_t kHighlightFlashMs = 130;  // 触摸命中白闪时长
 constexpr uint32_t kBtnBHoldMs       = 700;  // B 键长按阈值
 
+constexpr uint32_t kBatteryRefreshMs = 5000;  // 电量刷新间隔（ms）
+constexpr uint8_t  kLowBatteryLevel  = 20;    // 低电量阈值（%）
+
 // ===================== 物理按键（StopWatch：BtnA=GPIO2，BtnB=GPIO1，低电平按下） =====================
 constexpr int     kBtnAPin   = 2;
 constexpr int     kBtnBPin   = 1;
@@ -63,6 +66,14 @@ static bool     blueLongPress     = false;
 static uint32_t blueRepeatLastMs  = 0;
 static int32_t  highlight         = -1;
 static uint32_t highlightSetMs    = 0;
+
+// ===================== 电量显示（借鉴 voice-coding-badge） =====================
+static uint32_t lastBatteryReadMs           = 0;
+static int32_t  currentBatteryLevel         = -1;
+static int8_t   currentChargingState        = -1;   // 1=充电 0=放电 -1=未知
+static int32_t  lastDrawnBatteryLevel       = -100;
+static int8_t   lastDrawnChargingState      = -100;
+static int16_t  lastReportedBleBatteryLevel = -1;
 
 // ===================== HID 发送（BLE 键盘） =====================
 static void pressModifiers(uint8_t m) {
@@ -281,6 +292,86 @@ static void handleButtons() {
   bPrev = b;
 }
 
+// ===================== 电量显示（借鉴 voice-coding-badge） =====================
+static void updateBatterySnapshot(bool force) {
+  uint32_t now = millis();
+  if (!force && (now - lastBatteryReadMs) < kBatteryRefreshMs) return;
+  lastBatteryReadMs = now;
+
+  currentBatteryLevel = M5.Power.getBatteryLevel();
+  const auto charging = M5.Power.isCharging();
+  currentChargingState = charging == m5::Power_Class::is_charging_t::is_charging ? 1
+                       : charging == m5::Power_Class::is_charging_t::is_discharging ? 0 : -1;
+
+  // 通过 BLE Battery Service (0x2A19) 上报真实电量，让 Mac 蓝牙菜单显示真实百分比
+  if (currentBatteryLevel >= 0) {
+    uint8_t bleLevel = currentBatteryLevel > 100 ? 100 : (uint8_t)currentBatteryLevel;
+    if (bleLevel != lastReportedBleBatteryLevel) {
+      bleKeyboard.setBatteryLevel(bleLevel);
+      lastReportedBleBatteryLevel = bleLevel;
+    }
+  }
+}
+
+static void drawBatteryIndicator(bool force) {
+  updateBatterySnapshot(force);
+  if (!force && currentBatteryLevel == lastDrawnBatteryLevel &&
+      currentChargingState == lastDrawnChargingState) {
+    return;
+  }
+  lastDrawnBatteryLevel  = currentBatteryLevel;
+  lastDrawnChargingState = currentChargingState;
+
+  const int32_t screenW = M5.Display.width();
+  const int32_t iconW   = 40;
+  const int32_t iconH   = 18;
+  const int32_t totalW  = 118;
+  const int32_t x       = (screenW - totalW) / 2;
+  const int32_t y       = M5.Display.height() - 36;   // 底部黑色留白区（饼图下方）
+  const int32_t iconX   = x;
+  const int32_t iconY   = y + 2;
+  const int32_t fillMax = iconW - 6;
+  const int32_t pctX    = iconX + iconW + 8;
+
+  // 只清电池区域，不碰饼图
+  M5.Display.fillRect(x - 4, y - 2, totalW + 8, 32, kColorBlack);
+
+  // 电池外框 + 正极凸起
+  M5.Display.drawRoundRect(iconX, iconY, iconW, iconH, 3, kColorWhite);
+  M5.Display.fillRect(iconX + iconW, iconY + 6, 3, 8, kColorWhite);
+
+  uint32_t fg = kColorWhite;
+  if (currentChargingState == 1) {
+    fg = 0x00FF00;   // 充电绿
+  } else if (currentBatteryLevel >= 0 && currentBatteryLevel <= kLowBatteryLevel) {
+    fg = 0xFF0000;   // 低电量红
+  }
+
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextSize(1);
+  if (currentBatteryLevel >= 0) {
+    int32_t lvl   = currentBatteryLevel > 100 ? 100 : currentBatteryLevel;
+    int32_t fillW = (fillMax * lvl) / 100;
+    if (fillW > 0) {
+      M5.Display.fillRect(iconX + 3, iconY + 3, fillW, iconH - 6, fg);
+    }
+    M5.Display.setTextColor(fg, kColorBlack);
+    M5.Display.setCursor(pctX, y + 6);
+    M5.Display.printf("%d%%", (int)currentBatteryLevel);
+  } else {
+    M5.Display.setTextColor(kColorGray, kColorBlack);
+    M5.Display.setCursor(pctX, y + 6);
+    M5.Display.print("--");
+  }
+
+  // 充电闪电标记
+  if (currentChargingState == 1) {
+    M5.Display.drawLine(iconX + 22, iconY + 3,  iconX + 15, iconY + 11, 0xFFFF00);
+    M5.Display.drawLine(iconX + 15, iconY + 11, iconX + 23, iconY + 11, 0xFFFF00);
+    M5.Display.drawLine(iconX + 23, iconY + 11, iconX + 16, iconY + 16, 0xFFFF00);
+  }
+}
+
 // ===================== 主流程 =====================
 void setup() {
   auto cfg = M5.config();
@@ -305,6 +396,9 @@ void setup() {
   // BLE 键盘：开始广播，Mac「蓝牙」里配对 "StopWatchHID"
   bleKeyboard.begin();
 
+  // 初始电量显示（同时上报真实电量到 BLE Battery Service）
+  drawBatteryIndicator(true);
+
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(0x00FF00);
   M5.Display.setCursor(2, 2);
@@ -326,5 +420,6 @@ void loop() {
 
   handleButtons();
   handleTouch();
+  drawBatteryIndicator(false);   // 每 5s 刷新电量显示 + BLE 上报
   delay(5);
 }
