@@ -1,25 +1,24 @@
 /*
- * StopWatchHID — M5Stack StopWatch 三扇区饼图 USB 键盘 + 原生 USB 麦克风
+ * StopWatchHID — M5Stack StopWatch 三扇区饼图 BLE 键盘（无麦克风）
  *
- * 最终版（键盘改用 USB HID，与麦克风走同一根 USB 线，不再依赖蓝牙配对）：
- *   - 三扇区饼图触摸：复制(Cmd+C) / 删除(Backspace 按住连删) / 粘贴(Cmd+V)
- *   - USB HID 键盘：BtnA 按住=右Option、BtnB 单击=回车、BtnB 长按=撤销(Cmd+Z)
- *   - 原生 USB 麦克风：USBAudioCard(UAC1) + ES8311，Mac 输入里直接显示设备
- *   - USB 复合设备：同一个 USB 口同时提供「麦克风 + 键盘」
+ * 修改版：
+ *   - 连接方式由 USB HID 改为 BLE 蓝牙键盘。
+ *     蓝牙方案借鉴 voice-coding-badge 仓库：
+ *       平台 espressif32 @ 6.12.0 + board esp32s3box
+ *       + -DUSE_NIMBLE + h2zero/NimBLE-Arduino + t-vk/ESP32 BLE Keyboard
+ *   - 完全移除原生 USB 麦克风（本固件不做任何音频传输）。
+ *   - 保留：三扇区饼图触摸（复制/删除/粘贴）+ A/B 物理按键。
  *
- * 物理按键直接读 GPIO（GPIO2=A、GPIO1=B，低电平按下），触摸直接读 M5GFX 并归一化。
+ * 饼图触摸：复制(Cmd+C) / 删除(Backspace 按住连删) / 粘贴(Cmd+V)
+ * 物理按键：BtnA 按住=右Option、BtnB 单击=回车、BtnB 长按=撤销(Cmd+Z)
  */
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <math.h>
-#include <USB.h>
-#include <USBAudioCard.h>
-#include <USBHIDKeyboard.h>
-#include <tusb.h>
-#include <atomic>
+#include <BleKeyboard.h>
 
-// ===================== USB 键盘（替代蓝牙键盘） =====================
-USBHIDKeyboard usbKeyboard;
+// ===================== BLE 键盘（替代 USB 键盘，蓝牙配对后使用） =====================
+BleKeyboard bleKeyboard("StopWatchHID", "M5Stack", 100);
 
 // ===================== 饼图几何（动态，适配屏幕实际分辨率） =====================
 static int32_t  kCx     = 233;
@@ -55,20 +54,6 @@ static bool     optionHeld  = false;
 static bool     btnBHeld    = false;
 static uint32_t btnBPressMs = 0;
 
-// ===================== USB 麦克风 =====================
-static USBAudioCard usbAudio(48000, UAC_BPS_16, UAC_SPK_NONE, UAC_MIC_MONO);
-constexpr uint32_t kMicRate         = 48000;
-constexpr size_t   kMicBlockSamples = 480;   // 10ms
-constexpr size_t   kMicBlockBytes   = kMicBlockSamples * 2;
-
-static int16_t     micBuf[2][kMicBlockSamples];
-static QueueHandle_t micQueue = nullptr;
-static TaskHandle_t  micCaptureTask = nullptr;
-static TaskHandle_t  micFeedTask = nullptr;
-static std::atomic<bool> micStreaming{false};
-
-struct MicBlock { int16_t s[kMicBlockSamples]; };
-
 // ===================== 触摸状态 =====================
 static bool     touchActive       = false;
 static int32_t  touchSector       = -1;
@@ -79,50 +64,53 @@ static uint32_t blueRepeatLastMs  = 0;
 static int32_t  highlight         = -1;
 static uint32_t highlightSetMs    = 0;
 
-// ===================== HID 发送 =====================
+// ===================== HID 发送（BLE 键盘） =====================
 static void pressModifiers(uint8_t m) {
-  if (m & 0x01) usbKeyboard.press(KEY_LEFT_CTRL);
-  if (m & 0x02) usbKeyboard.press(KEY_LEFT_SHIFT);
-  if (m & 0x04) usbKeyboard.press(KEY_LEFT_ALT);
-  if (m & 0x08) usbKeyboard.press(KEY_LEFT_GUI);
-  if (m & 0x10) usbKeyboard.press(KEY_RIGHT_CTRL);
-  if (m & 0x20) usbKeyboard.press(KEY_RIGHT_SHIFT);
-  if (m & 0x40) usbKeyboard.press(KEY_RIGHT_ALT);
-  if (m & 0x80) usbKeyboard.press(KEY_RIGHT_GUI);
+  if (m & 0x01) bleKeyboard.press(KEY_LEFT_CTRL);
+  if (m & 0x02) bleKeyboard.press(KEY_LEFT_SHIFT);
+  if (m & 0x04) bleKeyboard.press(KEY_LEFT_ALT);
+  if (m & 0x08) bleKeyboard.press(KEY_LEFT_GUI);
+  if (m & 0x10) bleKeyboard.press(KEY_RIGHT_CTRL);
+  if (m & 0x20) bleKeyboard.press(KEY_RIGHT_SHIFT);
+  if (m & 0x40) bleKeyboard.press(KEY_RIGHT_ALT);
+  if (m & 0x80) bleKeyboard.press(KEY_RIGHT_GUI);
 }
 static void releaseModifiers(uint8_t m) {
-  if (m & 0x01) usbKeyboard.release(KEY_LEFT_CTRL);
-  if (m & 0x02) usbKeyboard.release(KEY_LEFT_SHIFT);
-  if (m & 0x04) usbKeyboard.release(KEY_LEFT_ALT);
-  if (m & 0x08) usbKeyboard.release(KEY_LEFT_GUI);
-  if (m & 0x10) usbKeyboard.release(KEY_RIGHT_CTRL);
-  if (m & 0x20) usbKeyboard.release(KEY_RIGHT_SHIFT);
-  if (m & 0x40) usbKeyboard.release(KEY_RIGHT_ALT);
-  if (m & 0x80) usbKeyboard.release(KEY_RIGHT_GUI);
+  if (m & 0x01) bleKeyboard.release(KEY_LEFT_CTRL);
+  if (m & 0x02) bleKeyboard.release(KEY_LEFT_SHIFT);
+  if (m & 0x04) bleKeyboard.release(KEY_LEFT_ALT);
+  if (m & 0x08) bleKeyboard.release(KEY_LEFT_GUI);
+  if (m & 0x10) bleKeyboard.release(KEY_RIGHT_CTRL);
+  if (m & 0x20) bleKeyboard.release(KEY_RIGHT_SHIFT);
+  if (m & 0x40) bleKeyboard.release(KEY_RIGHT_ALT);
+  if (m & 0x80) bleKeyboard.release(KEY_RIGHT_GUI);
 }
 static void sendHID(uint8_t modifier, uint8_t keycode) {
+  if (!bleKeyboard.isConnected()) return;
   pressModifiers(modifier);
-  if (keycode != 0) usbKeyboard.press(keycode);
+  if (keycode != 0) bleKeyboard.press(keycode);
   delay(60);
-  if (keycode != 0) usbKeyboard.release(keycode);
+  if (keycode != 0) bleKeyboard.release(keycode);
   releaseModifiers(modifier);
-  usbKeyboard.releaseAll();
+  bleKeyboard.releaseAll();
 }
 static void tapBackspace() {
-  usbKeyboard.press(KEY_BACKSPACE);
+  if (!bleKeyboard.isConnected()) return;
+  bleKeyboard.press(KEY_BACKSPACE);
   delay(20);
-  usbKeyboard.release(KEY_BACKSPACE);
-  usbKeyboard.releaseAll();
+  bleKeyboard.release(KEY_BACKSPACE);
+  bleKeyboard.releaseAll();
 }
 static void pressOption() {
   if (optionHeld) return;
-  usbKeyboard.press(KEY_RIGHT_ALT);
+  if (!bleKeyboard.isConnected()) return;
+  bleKeyboard.press(KEY_RIGHT_ALT);
   optionHeld = true;
 }
 static void releaseOption() {
   if (!optionHeld) return;
-  usbKeyboard.release(KEY_RIGHT_ALT);
-  usbKeyboard.releaseAll();
+  bleKeyboard.release(KEY_RIGHT_ALT);
+  bleKeyboard.releaseAll();
   optionHeld = false;
 }
 
@@ -163,12 +151,9 @@ static void clearHighlight() {
 static bool readTouchScreen(int16_t* outX, int16_t* outY) {
   if (M5.Display.touch() == nullptr) return false;
   // 用 M5.Touch 的缓存结果（由 M5.update() 更新）。
-  // 不能再直接 M5.Display.getTouch()：M5.update() 已经读过一次触摸数据，
-  // CST820B 读一次就会清掉，再读永远拿不到，导致扇形按键失效。
   auto t = M5.Touch.getDetail();
   if (!t.isPressed()) return false;
-  // CST820B 触摸坐标本身就是屏幕坐标系（0..466，与 466x466 屏幕一致），
-  // 直接使用，不要再做 x_max 归一化缩放，否则会双重缩放导致扇形错位。
+  // CST820B 触摸坐标本身就是屏幕坐标系（0..466，与 466x466 屏幕一致），直接使用。
   *outX = t.x;
   *outY = t.y;
   return true;
@@ -296,121 +281,11 @@ static void handleButtons() {
   bPrev = b;
 }
 
-// ===================== USB 麦克风 =====================
-// ES8311 语音增益（24dB PGA / 24dB ADC / +6dB 数字）
-static bool configureMicGain() {
-  m5gfx::i2c::i2c_temporary_switcher_t bus(1, GPIO_NUM_47, GPIO_NUM_48);
-  bool ok = true;
-  ok = M5.In_I2C.writeRegister8(0x18, 0x17, 0xCB, 100000) && ok;
-  ok = M5.In_I2C.writeRegister8(0x18, 0x16, 0x04, 100000) && ok;
-  ok = M5.In_I2C.writeRegister8(0x18, 0x14, 0x18, 100000) && ok;
-  ok = M5.In_I2C.writeRegister8(0x18, 0x1C, 0x6A, 100000) && ok;
-  bus.restore();
-  return ok;
-}
-
-static void micCaptureLoop(void*) {
-  for (int i = 0; i < 2; ++i) {
-    if (!M5.Mic.record(micBuf[i], kMicBlockSamples, kMicRate)) {
-      micCaptureTask = nullptr; vTaskDelete(nullptr); return;
-    }
-  }
-  size_t buf = 0;
-  for (;;) {
-    while (M5.Mic.isRecording() >= 2) vTaskDelay(1);
-    MicBlock blk;
-    memcpy(blk.s, micBuf[buf], kMicBlockBytes);
-    if (xQueueSend(micQueue, &blk, pdMS_TO_TICKS(50)) != pdTRUE) {
-      MicBlock drop;
-      xQueueReceive(micQueue, &drop, 0);
-      xQueueSend(micQueue, &blk, 0);
-    }
-    if (!M5.Mic.record(micBuf[buf], kMicBlockSamples, kMicRate)) {
-      micCaptureTask = nullptr; vTaskDelete(nullptr); return;
-    }
-    buf ^= 1;
-  }
-}
-
-static void micFeedLoop(void*) {
-  MicBlock blk;
-  for (;;) {
-    if (xQueueReceive(micQueue, &blk, pdMS_TO_TICKS(1000)) != pdTRUE) continue;
-    const uint8_t* p = (const uint8_t*)blk.s;
-    size_t rem = kMicBlockBytes;
-    while (rem > 0) {
-      size_t n = usbAudio.write(p + (kMicBlockBytes - rem), rem);
-      if (n == 0) { vTaskDelay(1); continue; }
-      rem -= n;
-    }
-  }
-}
-
-static void usbAudioEvent(void*, esp_event_base_t base, int32_t id, void* data) {
-  if (base != ARDUINO_USB_AUDIO_CARD_EVENTS ||
-      id != ARDUINO_USB_AUDIO_CARD_INTERFACE_ENABLE_EVENT || data == nullptr) return;
-  auto* d = static_cast<const arduino_usb_audio_card_event_data_t*>(data);
-  if (d->interface_enable.interface != UAC_INTERFACE_MIC) return;
-  micStreaming.store(d->interface_enable.enable);
-  if (d->interface_enable.enable) {
-    tu_fifo_t* ff = tud_audio_get_ep_in_ff();
-    if (ff != nullptr) {
-      uint16_t target = tud_audio_get_ep_in_fifo_threshold();
-      uint16_t half = tu_fifo_depth(ff) / 2U;
-      if (target == 0 || target > half) target = half;
-      const uint8_t silence[256] = {0};
-      while (tu_fifo_count(ff) < target) {
-        uint16_t req = target - tu_fifo_count(ff);
-        if (req > sizeof(silence)) req = sizeof(silence);
-        if (usbAudio.write(silence, req) == 0) break;
-      }
-    }
-  }
-}
-
-static bool beginUsbMic() {
-  M5.Speaker.end();
-  auto mc = M5.Mic.config();
-  mc.sample_rate = kMicRate;
-  mc.input_channel = m5::input_only_right;
-  mc.dma_buf_len = 480;
-  mc.dma_buf_count = 4;
-  mc.over_sampling = 1;
-  mc.magnification = 2;
-  M5.Mic.config(mc);
-  if (!M5.Mic.begin()) return false;
-
-  M5.Mic.record(micBuf[0], kMicBlockSamples, kMicRate);
-  uint32_t t = millis();
-  while (M5.Mic.isRecording() != 0 && millis() - t < 100) vTaskDelay(1);
-  M5.Mic.end();
-  if (!M5.Mic.begin()) return false;
-  configureMicGain();
-
-  micQueue = xQueueCreate(2, sizeof(MicBlock));
-  if (micQueue == nullptr) return false;
-
-  usbAudio.onEvent(ARDUINO_USB_AUDIO_CARD_INTERFACE_ENABLE_EVENT, usbAudioEvent);
-  if (!usbAudio.begin()) return false;
-
-  USB.VID(0x303A);
-  USB.PID(0x0002);
-  USB.productName("StopWatch Mic + KB");
-  USB.manufacturerName("M5Stack");
-  USB.serialNumber("stopwatch-mic");
-  if (!USB.begin()) return false;
-
-  xTaskCreate(micCaptureLoop, "mic_cap", 4096, nullptr, 3, &micCaptureTask);
-  xTaskCreate(micFeedLoop, "mic_feed", 4096, nullptr, 2, &micFeedTask);
-  return true;
-}
-
 // ===================== 主流程 =====================
 void setup() {
   auto cfg = M5.config();
   cfg.serial_baudrate = 115200;
-  cfg.internal_spk = false;   // 麦克风/扬声器共用 ES8311，用麦克风时关扬声器
-  cfg.internal_mic = true;
+  cfg.internal_spk = false;   // 无音频需求，关闭扬声器/编解码
   M5.begin(cfg);
 
   M5.Display.setRotation(0);
@@ -427,23 +302,28 @@ void setup() {
   M5.Display.fillScreen(kColorBlack);
   drawPie(-1);
 
-  // USB 键盘（必须在 USB.begin() 之前调用 begin 初始化；接口由全局构造函数注册）
-  usbKeyboard.begin();
+  // BLE 键盘：开始广播，Mac「蓝牙」里配对 "StopWatchHID"
+  bleKeyboard.begin();
 
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(0x00FF00);
   M5.Display.setCursor(2, 2);
-  M5.Display.print("USB KB OK");
+  M5.Display.print("BLE KB OK");
 
-  if (beginUsbMic()) {
-    M5.Display.setTextColor(0x00FF00);
-    M5.Display.setCursor(2, 18);
-    M5.Display.print("USB MIC OK");
-  }
+  Serial.begin(115200);
+  Serial.println("[StopWatchHID] BLE keyboard advertising as StopWatchHID");
 }
 
 void loop() {
   M5.update();
+
+  static bool lastConnected = false;
+  bool connected = bleKeyboard.isConnected();
+  if (connected != lastConnected) {
+    lastConnected = connected;
+    Serial.println(connected ? "[BLE] connected" : "[BLE] disconnected");
+  }
+
   handleButtons();
   handleTouch();
   delay(5);
