@@ -15,10 +15,56 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <math.h>
+#include <string.h>
 #include <BleKeyboard.h>
+#include <NimBLEDevice.h>
 
-// ===================== BLE 键盘（替代 USB 键盘，蓝牙配对后使用） =====================
-BleKeyboard bleKeyboard("StopWatchHID", "M5Stack", 100);
+// ===================== BLE 键盘 + DeepSeek 余额接收（借鉴 voice-coding-badge） =====================
+static char gBalance[32] = {0};
+static volatile bool gBalanceDirty = false;
+static portMUX_TYPE gBalanceMux = portMUX_INITIALIZER_UNLOCKED;
+
+class BalanceCharCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c) override {
+    std::string v = c->getValue();
+    if (v.size() >= sizeof(gBalance)) v.resize(sizeof(gBalance) - 1);
+    portENTER_CRITICAL(&gBalanceMux);
+    strncpy(gBalance, v.c_str(), sizeof(gBalance) - 1);
+    gBalance[sizeof(gBalance) - 1] = '\0';
+    portEXIT_CRITICAL(&gBalanceMux);
+    gBalanceDirty = true;
+    Serial.printf("[Balance] %s\n", gBalance);
+  }
+};
+static BalanceCharCallbacks gBalanceCallbacks;
+
+class DebugBleKeyboard : public BleKeyboard {
+ public:
+  DebugBleKeyboard(std::string name, std::string mfr, uint8_t battery)
+      : BleKeyboard(name, mfr, battery) {}
+
+ protected:
+  void onStarted(BLEServer* pServer) override {
+    // 自定义 GATT 服务：Mac 端余额助手把 DeepSeek 余额写进 0xFFF1
+    NimBLEService* svc = pServer->createService(NimBLEUUID((uint16_t)0xFFF0));
+    NimBLECharacteristic* ch = svc->createCharacteristic(
+        NimBLEUUID((uint16_t)0xFFF1), NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    ch->setCallbacks(&gBalanceCallbacks);
+    svc->start();
+    Serial.println("[Balance] GATT 0xFFF0 ready (balance 0xFFF1)");
+  }
+  void onConnect(BLEServer* pServer) override {
+    BleKeyboard::onConnect(pServer);
+    // 保持广播，让 Mac 余额助手作为第二个 central 仍能连接（NimBLE 最多 3 连接）
+    NimBLEDevice::startAdvertising();
+  }
+  void onDisconnect(BLEServer* pServer) override {
+    BleKeyboard::onDisconnect(pServer);
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+DebugBleKeyboard bleKeyboard("StopWatchHID", "M5Stack", 100);
 
 // ===================== 饼图几何（动态，适配屏幕实际分辨率） =====================
 static int32_t  kCx     = 233;
@@ -322,19 +368,16 @@ static void drawBatteryIndicator(bool force) {
   lastDrawnBatteryLevel  = currentBatteryLevel;
   lastDrawnChargingState = currentChargingState;
 
-  const int32_t screenW = M5.Display.width();
   const int32_t iconW   = 40;
   const int32_t iconH   = 18;
-  const int32_t totalW  = 118;
-  const int32_t x       = (screenW - totalW) / 2;
   const int32_t y       = M5.Display.height() - 36;   // 底部黑色留白区（饼图下方）
-  const int32_t iconX   = x;
+  const int32_t iconX   = 130;   // 电池靠左，右侧留给 DeepSeek 余额
   const int32_t iconY   = y + 2;
   const int32_t fillMax = iconW - 6;
   const int32_t pctX    = iconX + iconW + 8;
 
   // 只清电池区域，不碰饼图
-  M5.Display.fillRect(x - 4, y - 2, totalW + 8, 32, kColorBlack);
+  M5.Display.fillRect(iconX - 4, y - 2, 92, 32, kColorBlack);
 
   // 电池外框 + 正极凸起
   M5.Display.drawRoundRect(iconX, iconY, iconW, iconH, 3, kColorWhite);
@@ -372,6 +415,34 @@ static void drawBatteryIndicator(bool force) {
   }
 }
 
+// ===================== DeepSeek 余额显示（Mac 通过 BLE 写入，风格同电量） =====================
+static void drawBalanceIndicator() {
+  const int32_t y    = M5.Display.height() - 36;
+  const int32_t balX = 236;
+
+  // 只清余额区域，不碰电量/饼图
+  M5.Display.fillRect(balX - 4, y - 2, 128, 32, kColorBlack);
+
+  char buf[32];
+  portENTER_CRITICAL(&gBalanceMux);
+  strncpy(buf, gBalance, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+  portEXIT_CRITICAL(&gBalanceMux);
+
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextSize(1);
+  if (buf[0] != '\0') {
+    M5.Display.setTextColor(0x00A3FF, kColorBlack);   // 蓝色：DeepSeek 余额
+    M5.Display.setCursor(balX, y + 6);
+    M5.Display.print("DS ");
+    M5.Display.print(buf);
+  } else {
+    M5.Display.setTextColor(kColorGray, kColorBlack);
+    M5.Display.setCursor(balX, y + 6);
+    M5.Display.print("DS --");
+  }
+}
+
 // ===================== 主流程 =====================
 void setup() {
   auto cfg = M5.config();
@@ -398,6 +469,7 @@ void setup() {
 
   // 初始电量显示（同时上报真实电量到 BLE Battery Service）
   drawBatteryIndicator(true);
+  drawBalanceIndicator();
 
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(0x00FF00);
@@ -421,5 +493,9 @@ void loop() {
   handleButtons();
   handleTouch();
   drawBatteryIndicator(false);   // 每 5s 刷新电量显示 + BLE 上报
+  if (gBalanceDirty) {
+    gBalanceDirty = false;
+    drawBalanceIndicator();      // 收到新余额时刷新
+  }
   delay(5);
 }

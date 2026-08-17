@@ -13,6 +13,7 @@
 | ⌨️ BLE 键盘 | 饼图 + A/B 物理按键，走蓝牙 BLE（非 USB） |
 | 🔗 蓝牙连接 | 设备名 StopWatchHID，Mac「蓝牙」里配对后即用 |
 | 🔋 电量显示 | 底部电池图标 + 百分比，每 5s 刷新；充电绿 / 低电红，并上报 Mac 蓝牙菜单 |
+| 🧮 DeepSeek 余额 | 电量旁显示 DeepSeek API 余额（Mac 抓取后通过 BLE 推送） |
 
 ---
 
@@ -71,12 +72,41 @@
 
 ---
 
+## 🧮 DeepSeek 余额显示（Mac 推送）
+
+手表没有 Wi-Fi，DeepSeek 余额由 Mac 抓取后通过 BLE 自定义特征推送到手表，显示在电量旁边（风格同电量）。
+
+- 固件侧：BLE 服务 0xFFF0 / 特征 0xFFF1，收到余额字符串后显示为 `DS 12.34`。
+- Mac 侧：`balance-client/`（Swift）负责 HTTP 抓取 + CoreBluetooth 写入。
+
+### 构建与使用
+
+    cd balance-client
+    swift build
+
+    export DEEPSEEK_API_KEY=sk-xxxx
+
+    # 抓取并打印余额
+    .build/debug/ds-balance --balance
+
+    # 抓取后写入手表
+    .build/debug/ds-balance --push-balance
+
+    # 每 60 秒抓取并持续推送
+    .build/debug/ds-balance --watch
+
+> 余额接口为 `GET https://api.deepseek.com/user/balance`（Bearer 认证），取 `balance_infos` 里 CNY 的 `total_balance`。
+> 在受限沙箱环境里构建若报 sandbox 错误，用 `swift build --disable-sandbox` 即可。
+
+---
+
 ## 📁 项目结构
 
     stopwatch-hid/
     ├── src/main.cpp                        # 固件主程序（全部逻辑）
     ├── platformio.ini                      # PlatformIO 工程配置
     ├── partitions_16mb_large_app.csv       # 16MB 分区表
+    ├── balance-client/                     # Mac 端 DeepSeek 余额抓取 + BLE 推送（Swift）
     └── README.md
 
 ---
@@ -134,6 +164,7 @@
    - A 键按住 = 右 Option（按住说话），B 键单击 = 回车 / 长按 = 撤销。
 4. 屏幕底部显示电量（电池图标 + 百分比）；充电时变绿并带闪电，电量 ≤20% 时变红。
    真实电量也会通过 BLE Battery Service 上报，Mac「蓝牙」菜单里能看到百分比。
+5. DeepSeek 余额显示在电量旁（默认 `DS --`）；Mac 上运行 balance-client 推送后即显示余额。
 
 ---
 

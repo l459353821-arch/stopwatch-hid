@@ -5,6 +5,10 @@
 build/
 managed_components/
 
+# Swift Package Manager
+.build/
+.swiftpm/
+
 # Compiled binaries / firmware images
 *.bin
 *.elf
