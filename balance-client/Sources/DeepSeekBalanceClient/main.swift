@@ -125,7 +125,7 @@ final class BLEBalanceWriter: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error { finish(success: false, reason: "发现服务失败：\(error.localizedDescription)"); return }
         guard let service = peripheral.services?.first(where: { $0.uuid == balanceServiceUUID }) else {
-            finish(success: false, reason: "未找到余额服务 0xFFF0")
+            finish(success: false, reason: "未找到余额服务 0xFFF0。请确认手表右下角显示 DS --（最新固件）；\n若已显示，请在 Mac 蓝牙里忘记 StopWatchHID 后重新配对，再重试。")
             return
         }
         peripheral.discoverCharacteristics([balanceCharUUID], for: service)
