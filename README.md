@@ -98,6 +98,19 @@
 > 余额接口为 `GET https://api.deepseek.com/user/balance`（Bearer 认证），取 `balance_infos` 里 CNY 的 `total_balance`。
 > 在受限沙箱环境里构建若报 sandbox 错误，用 `swift build --disable-sandbox` 即可。
 
+### 定时自动推送（launchd，可选）
+
+想让 Mac 每 5 分钟自动把余额推送到手表（开机自启、不用开终端）：
+
+    bash balance-client/install-launchd.sh <DEEPSEEK_API_KEY>
+
+- 任务名：com.stopwatch.ds-balance，每 300 秒执行一次 `ds-balance --push-balance`
+- 日志：~/Library/Logs/ds-balance.out.log / ds-balance.err.log
+- 卸载：
+
+      launchctl bootout gui/$(id -u)/com.stopwatch.ds-balance
+      rm ~/Library/LaunchAgents/com.stopwatch.ds-balance.plist
+
 ---
 
 ## 📁 项目结构
