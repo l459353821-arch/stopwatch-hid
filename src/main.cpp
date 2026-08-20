@@ -8,9 +8,12 @@
  *       + -DUSE_NIMBLE + h2zero/NimBLE-Arduino + t-vk/ESP32 BLE Keyboard
  *   - 完全移除原生 USB 麦克风（本固件不做任何音频传输）。
  *   - 保留：三扇区饼图触摸（复制/删除/粘贴）+ A/B 物理按键。
+ *   - 新增：饼图虚拟按键触摸时震动马达反馈（M5IOE1 PYG9 PWM）。
+ *   - 新增：电源键单击改为熄屏/亮屏切换（M5PM1，单击不复位）。
  *
- * 饼图触摸：复制(Cmd+C) / 删除(Backspace 按住连删) / 粘贴(Cmd+V)
- * 物理按键：BtnA 按住=右Option、BtnB 单击=回车、BtnB 长按=撤销(Cmd+Z)
+ * 饼图触摸：复制(Cmd+C) / 删除(Backspace 按住连删) / 粘贴(Cmd+V)，命中即震动
+ * 物理按键：BtnA 短按=Shift+回车（聊天换行）、长按=语音功能(右Option)；BtnB 单击=回车、长按=撤销(Cmd+Z)
+ * 电源键：单击=熄屏/亮屏；双击=关机；长按(≈2s)=进入下载模式（均为 M5PM1 硬件行为）
  */
 #include <Arduino.h>
 #include <M5Unified.h>
@@ -18,6 +21,8 @@
 #include <string.h>
 #include <BleKeyboard.h>
 #include <NimBLEDevice.h>
+#include <M5PM1.h>
+#include <utility/M5IOE1_Class.hpp>
 
 // ===================== BLE 键盘 + DeepSeek 余额接收（借鉴 voice-coding-badge） =====================
 static char gBalance[32] = {0};
@@ -80,10 +85,24 @@ constexpr uint32_t kTouchDebounceMs  = 40;   // 触摸去抖
 constexpr uint32_t kBlueHoldMs       = 200;  // 蓝色长按阈值（超过才开始连删）
 constexpr uint32_t kBlueRepeatMs     = 100;  // 蓝色长按连删间隔
 constexpr uint32_t kHighlightFlashMs = 130;  // 触摸命中白闪时长
-constexpr uint32_t kBtnBHoldMs       = 700;  // B 键长按阈值
+constexpr uint32_t kBtnAHoldMs  = 500;   // A 键长按（≥500ms 触发语音功能）
+constexpr uint32_t kBtnBHoldMs  = 700;   // B 键长按阈值
 
 constexpr uint32_t kBatteryRefreshMs = 5000;  // 电量刷新间隔（ms）
 constexpr uint8_t  kLowBatteryLevel  = 20;    // 低电量阈值（%）
+
+// 触觉反馈强度（0..255，M5.Power.setVibration 语义，同 codex-micro-stopwatch）
+// 马达启动阈值约 56% 占空比，176 与物理按键手感一致：稳定、无明显丢震
+constexpr uint8_t  kHapticIntensity   = 176;
+
+// ===================== 震动马达 + 电源键（M5IOE1 / M5PM1，参考 codex-micro-stopwatch） =====================
+// 震动马达在 M5IOE1 的 PYG9(IO9)，由 M5.Power.setVibration() 驱动（内部写 PWM1）。
+// 马达供电来自 3V3_L3B 电源轨，对应 M5IOE1 G8(PYB_L3B_EN)（零基索引仅用于开电源轨）。
+constexpr uint8_t  kScreenBrightness = 120;             // 亮屏亮度（同 setup 里初始值）
+
+// 电源键单击：短按判定区间，避免误触与长按（进入下载模式）冲突
+constexpr uint32_t kPwrClickMinMs = 40;    // 触摸去抖后的最小按下时长
+constexpr uint32_t kPwrClickMaxMs = 1000;  // 超过则视为长按，不切换屏幕
 
 // ===================== 物理按键（StopWatch：BtnA=GPIO2，BtnB=GPIO1，低电平按下） =====================
 constexpr int     kBtnAPin   = 2;
@@ -102,6 +121,8 @@ static Btn btnB = { kBtnBPin, false, 0 };
 static bool     optionHeld  = false;
 static bool     btnBHeld    = false;
 static uint32_t btnBPressMs = 0;
+static bool     btnAHeld    = false;
+static uint32_t btnAPressMs = 0;
 
 // ===================== 触摸状态 =====================
 static bool     touchActive       = false;
@@ -120,6 +141,100 @@ static int8_t   currentChargingState        = -1;   // 1=充电 0=放电 -1=未�
 static int32_t  lastDrawnBatteryLevel       = -100;
 static int8_t   lastDrawnChargingState      = -100;
 static int16_t  lastReportedBleBatteryLevel = -1;
+
+// ===================== 震动马达 + 电源键（M5IOE1 / M5PM1） =====================
+// 震动方案完全移植自 codex-micro-stopwatch：
+//   1) 震动 = M5Unified 内置 M5.Power.setVibration(level)，level 0..255
+//      （内部写 M5IOE1 PWM1 -> IO9/G9 马达，已含 EN 位与占空比换算）
+//   2) 马达供电来自 3V3_L3B 电源轨，由 M5IOE1 G8(PYB_L3B_EN) 负载开关控制，
+//      必须先经 setHighImpedance(推挽) + digitalWrite 置高，否则马达无电。
+constexpr uint8_t kL3bEnIndex = 7;   // M5IOE1 G8（零基索引，同参考项目 kIoeSharedL3bEnable）
+static bool     gIoeReady = false;
+
+// 震动状态（非阻塞：参考项目 startHaptic/stopHaptic 模式）
+static bool     gVibrateActive   = false;
+static uint32_t gVibrateUntilMs  = 0;
+static uint8_t  gVibrateStrength = 0;
+
+// 电源键（M5PM1）
+static M5PM1  gPm1;
+static bool   gPm1Ready    = false;
+static bool   gScreenOn    = true;
+static int32_t gBrightness = kScreenBrightness;
+
+// 打开/关闭 3V3_L3B 电源轨（G8/PYB_L3B_EN），同参考项目 setSharedRail()
+static void setL3bRail(bool enabled) {
+  auto& ioe1 = M5.getIOExpander(0);
+  ioe1.setHighImpedance(kL3bEnIndex, false);   // 推挽输出（关键：否则 EN 浮空）
+  ioe1.setDirection(kL3bEnIndex, true);
+  ioe1.digitalWrite(kL3bEnIndex, enabled);
+}
+
+// ===================== 震动马达（M5.Power.setVibration，非阻塞） =====================
+static void vibrateInit() {
+  setL3bRail(true);                     // 开 L3B，马达才有供电
+  M5.Power.setVibration(0);             // 初始关闭 PWM
+  gIoeReady = true;
+  Serial.println("[VIB] motor ready (M5.Power.setVibration + L3B rail ON)");
+}
+
+// 触发一次震动（参考项目 startHaptic：立即输出，由 updateVibrator() 定时关闭）
+static void vibrate(uint16_t durationMs, uint8_t strength) {
+  if (!gIoeReady) return;
+  gVibrateStrength = strength;
+  gVibrateUntilMs  = millis() + durationMs;
+  gVibrateActive   = true;
+  M5.Power.setVibration(strength);
+}
+
+static void updateVibrator() {
+  if (!gVibrateActive) return;
+  if ((int32_t)(millis() - gVibrateUntilMs) < 0) return;
+  gVibrateActive = false;
+  M5.Power.setVibration(0);
+}
+
+// ===================== 电源键：单击熄屏/亮屏（M5PM1） =====================
+static void setScreenOn(bool on) {
+  gScreenOn = on;
+  M5.Display.setBrightness(on ? (uint8_t)gBrightness : 0);
+}
+
+static void powerInit() {
+  if (gPm1.begin(&M5.In_I2C, M5PM1_DEFAULT_ADDR) != M5PM1_OK) {
+    Serial.println("[PWR] M5PM1 init failed");
+    return;
+  }
+  gPm1Ready = true;
+  gPm1.setI2cSleepTime(0);  // 关闭 I2C 自动睡眠，保证电源键轮询稳定
+  // 单击电源键原本会硬件复位，这里禁用，改为由固件做熄屏/亮屏切换；
+  // 双击关机、长按(≈2s)下载模式为 M5PM1 硬件行为，保持不变。
+  gPm1.setSingleResetDisable(true);
+  Serial.println("[PWR] single-click -> screen toggle (hardware reset disabled)");
+}
+
+static void handlePowerButton() {
+  if (!gPm1Ready) return;
+  bool pressed = false;
+  if (gPm1.btnGetState(&pressed) != M5PM1_OK) return;
+
+  static bool prevPressed = false;
+  static uint32_t pressMs = 0;
+  uint32_t now = millis();
+
+  if (pressed && !prevPressed) {
+    pressMs = now;
+  } else if (!pressed && prevPressed) {
+    uint32_t held = now - pressMs;
+    // 短按 → 切换熄屏/亮屏；长按(≥1s)忽略，留给下载模式
+    if (held >= kPwrClickMinMs && held < kPwrClickMaxMs) {
+      setScreenOn(!gScreenOn);
+      vibrate(20, kHapticIntensity);  // 电源键：短反馈
+      Serial.printf("[PWR] screen %s\n", gScreenOn ? "ON" : "OFF");
+    }
+  }
+  prevPressed = pressed;
+}
 
 // ===================== HID 发送（BLE 键盘） =====================
 static void pressModifiers(uint8_t m) {
@@ -232,6 +347,18 @@ static void handleTouch() {
   bool touching = readTouchScreen(&tx, &ty);
   uint32_t now = millis();
 
+  // 熄屏时忽略触摸，避免误触发复制/删除/粘贴（亮屏后自动恢复）
+  if (!gScreenOn) {
+    if (touchActive) {
+      touchActive = false;
+      touchSector = -1;
+      blueLongPress = false;
+      singleActionFired = false;
+      clearHighlight();
+    }
+    return;
+  }
+
   if (touching) {
     if (!touchActive) {
       touchActive = true;
@@ -266,9 +393,11 @@ static void handleTouch() {
         blueRepeatLastMs = now;
         highlight = 1;   // 长按期间高亮保持
         drawPie(1);
+        vibrate(20, kHapticIntensity);  // 蓝色长按起始
         tapBackspace();
       }
       if (blueLongPress && (now - blueRepeatLastMs) >= kBlueRepeatMs) {
+        vibrate(12, kHapticIntensity);  // 连删节拍
         tapBackspace();
         blueRepeatLastMs = now;
       }
@@ -276,6 +405,7 @@ static void handleTouch() {
       // 橙色 / 灰色：单击发一次
       if (!singleActionFired) {
         singleActionFired = true;
+        vibrate(25, kHapticIntensity);  // 橙/灰单击反馈
         if (sector == 0) sendHID(0x08, 'c');  // Cmd+C 复制（Mac；若需字面 Ctrl 键改为 0x01）
         else             sendHID(0x08, 'v');  // Cmd+V 粘贴
       }
@@ -285,6 +415,7 @@ static void handleTouch() {
       uint32_t held = now - touchStartMs;
       // 蓝色单击：抬手且未到长按阈值 → 发一次退格
       if (touchSector == 1 && !blueLongPress && held >= kTouchDebounceMs && held < kBlueHoldMs) {
+        vibrate(20, kHapticIntensity);  // 蓝色单击抬手
         tapBackspace();
       }
       touchActive = false;
@@ -320,8 +451,19 @@ static void handleButtons() {
   uint32_t now = millis();
   static bool aPrev = false, bPrev = false;
 
-  if (a && !aPrev) pressOption();
-  if (!a && aPrev) releaseOption();
+  // A 键（黄色）：短按=Shift+回车（聊天换行，不发送）；长按≥500ms=语音功能（按住右Option）
+  if (a && !aPrev) { btnAPressMs = now; btnAHeld = false; }
+  if (a && !btnAHeld && (now - btnAPressMs) >= kBtnAHoldMs) {
+    btnAHeld = true;
+    pressOption();   // 长按触发语音功能（按住）
+  }
+  if (!a && aPrev) {
+    if (!btnAHeld && (now - btnAPressMs) >= kBtnDebounceMs) {
+      sendHID(0x02, KEY_RETURN);   // 左Shift + 回车
+    }
+    releaseOption();
+    btnAHeld = false;
+  }
   aPrev = a;
 
   if (b && !bPrev) { btnBPressMs = now; btnBHeld = false; }
@@ -451,7 +593,18 @@ void setup() {
   M5.begin(cfg);
 
   M5.Display.setRotation(0);
-  M5.Display.setBrightness(120);
+  M5.Display.setBrightness(kScreenBrightness);
+  gBrightness = kScreenBrightness;
+
+  // 震动马达 + 电源键初始化（M5IOE1 / M5PM1，需在 M5.begin 之后，I2C 总线就绪）
+  vibrateInit();
+  powerInit();
+
+  // 开机自检震动：两次（各 150ms），方便体感确认马达正常
+  vibrate(150, kHapticIntensity);
+  delay(300);
+  vibrate(150, kHapticIntensity);
+  delay(150);
 
   kCx = M5.Display.width() / 2;
   kCy = M5.Display.height() / 2;
@@ -491,7 +644,9 @@ void loop() {
   }
 
   handleButtons();
+  handlePowerButton();
   handleTouch();
+  updateVibrator();
   drawBatteryIndicator(false);   // 每 5s 刷新电量显示 + BLE 上报
   if (gBalanceDirty) {
     gBalanceDirty = false;
