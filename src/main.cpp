@@ -10,7 +10,7 @@
  *   - 保留：三扇区饼图触摸（复制/删除/粘贴）+ A/B 物理按键。
  *
  * 饼图触摸：复制(Cmd+C) / 删除(Backspace 按住连删) / 粘贴(Cmd+V)
- * 物理按键：BtnA 按住=右Option、BtnB 单击=回车、BtnB 长按=撤销(Cmd+Z)
+ * 物理按键：BtnA 按住=右Option(松开释放)、BtnB 单击=回车、双击=Shift+回车、长按=撤销(Cmd+Z)
  */
 #include <Arduino.h>
 #include <M5Unified.h>
@@ -81,9 +81,15 @@ constexpr uint32_t kBlueHoldMs       = 200;  // 蓝色长按阈值（超过才�
 constexpr uint32_t kBlueRepeatMs     = 100;  // 蓝色长按连删间隔
 constexpr uint32_t kHighlightFlashMs = 130;  // 触摸命中白闪时长
 constexpr uint32_t kBtnBHoldMs       = 700;  // B 键长按阈值
+constexpr uint32_t kDoubleClickWindowMs = 300;  // B 键双击判定窗口（两次按下间隔）
 
 constexpr uint32_t kBatteryRefreshMs = 5000;  // 电量刷新间隔（ms）
 constexpr uint8_t  kLowBatteryLevel  = 20;    // 低电量阈值（%）
+
+// 触摸震动反馈（M5IOE1 PWM1 → IO9/G9 马达，M5.Power.setVibration 驱动）
+constexpr uint8_t  kBuzzLevel   = 220;  // 震动强度 0-255
+constexpr uint32_t kBuzzMs      = 30;   // 触摸命中震动时长
+constexpr uint32_t kBuzzHoldMs  = 60;   // 蓝色进入连删模式的震动时长
 
 // ===================== 物理按键（StopWatch：BtnA=GPIO2，BtnB=GPIO1，低电平按下） =====================
 constexpr int     kBtnAPin   = 2;
@@ -99,9 +105,11 @@ struct Btn {
 static Btn btnA = { kBtnAPin, false, 0 };
 static Btn btnB = { kBtnBPin, false, 0 };
 
-static bool     optionHeld  = false;
-static bool     btnBHeld    = false;
-static uint32_t btnBPressMs = 0;
+static bool     optionHeld     = false;  // A 键按住期间右 Option 按下状态
+static bool     btnBHeld       = false;
+static uint32_t btnBPressMs    = 0;   // B 键最近一次按下时间
+static uint32_t bReleaseMs     = 0;   // B 键最近一次松开时间
+static bool     bSinglePending = false;  // B 键单击动作等待双击窗口判定
 
 // ===================== 触摸状态 =====================
 static bool     touchActive       = false;
@@ -158,6 +166,7 @@ static void tapBackspace() {
   bleKeyboard.release(KEY_BACKSPACE);
   bleKeyboard.releaseAll();
 }
+// A 键：按住 = 右 Option（⌥）按下，松开 = 释放
 static void pressOption() {
   if (optionHeld) return;
   if (!bleKeyboard.isConnected()) return;
@@ -169,6 +178,23 @@ static void releaseOption() {
   bleKeyboard.release(KEY_RIGHT_ALT);
   bleKeyboard.releaseAll();
   optionHeld = false;
+}
+
+// ===================== 触摸震动反馈（M5IOE1 PWM1 → IO9/G9 马达） =====================
+static bool     motorOn      = false;
+static uint32_t motorUntilMs = 0;
+
+static void buzzMotor(uint8_t level, uint32_t durationMs) {
+  if (M5.getBoard() != m5::board_t::board_M5StopWatch) return;  // 仅 StopWatch 有马达
+  M5.Power.setVibration(level);
+  motorUntilMs = millis() + durationMs;
+  motorOn = true;
+}
+static void updateMotorBuzz() {
+  if (motorOn && (int32_t)(millis() - motorUntilMs) >= 0) {
+    motorOn = false;
+    M5.Power.setVibration(0);
+  }
 }
 
 // ===================== 饼图绘制 =====================
@@ -251,12 +277,13 @@ static void handleTouch() {
       return;
     }
 
-    // 首次进入该扇区：白闪反馈
+    // 首次进入该扇区：白闪反馈 + 马达震动
     if (touchSector != sector) {
       touchSector = sector;
       highlight = sector;
       highlightSetMs = now;
       drawPie(sector);
+      buzzMotor(kBuzzLevel, kBuzzMs);
     }
 
     if (sector == 1) {
@@ -267,6 +294,7 @@ static void handleTouch() {
         highlight = 1;   // 长按期间高亮保持
         drawPie(1);
         tapBackspace();
+        buzzMotor(kBuzzLevel, kBuzzHoldMs);   // 进入连删模式的提示震动
       }
       if (blueLongPress && (now - blueRepeatLastMs) >= kBlueRepeatMs) {
         tapBackspace();
@@ -320,22 +348,42 @@ static void handleButtons() {
   uint32_t now = millis();
   static bool aPrev = false, bPrev = false;
 
+  // A 键：按住 = 右 Option ⌥，松开 = 释放
   if (a && !aPrev) pressOption();
   if (!a && aPrev) releaseOption();
   aPrev = a;
 
-  if (b && !bPrev) { btnBPressMs = now; btnBHeld = false; }
+  // B 键：单击=回车、双击=Shift+回车、长按(700ms)=撤销 Cmd+Z
+  if (b && !bPrev) {
+    if (bSinglePending && (now - bReleaseMs) < kDoubleClickWindowMs) {
+      // 双击：取消失败的单击动作，发 Shift+回车
+      bSinglePending = false;
+      sendHID(0x02, KEY_RETURN);   // 0x02 = 左 Shift
+      btnBHeld = true;             // 本次按住已消费：不触发长按撤销，松开不再挂起单击
+    } else {
+      btnBPressMs = now;
+      btnBHeld = false;
+    }
+  }
   if (b && !btnBHeld && (now - btnBPressMs) >= kBtnBHoldMs) {
     btnBHeld = true;
     sendHID(0x08, 'z');
   }
   if (!b && bPrev) {
-    if (!btnBHeld && (now - btnBPressMs) >= kBtnDebounceMs) {
-      sendHID(0x00, KEY_RETURN);
+    if (!btnBHeld) {
+      // 短按松开：先挂起单击动作，等双击窗口判定
+      bSinglePending = true;
+      bReleaseMs = now;
     }
     btnBHeld = false;
   }
   bPrev = b;
+
+  // 双击窗口到期（期间无第二次按下）→ 发回车
+  if (bSinglePending && !b && (now - bReleaseMs) >= kDoubleClickWindowMs) {
+    bSinglePending = false;
+    sendHID(0x00, KEY_RETURN);
+  }
 }
 
 // ===================== 电量显示（借鉴 voice-coding-badge） =====================
@@ -492,6 +540,7 @@ void loop() {
 
   handleButtons();
   handleTouch();
+  updateMotorBuzz();             // 触摸震动到时自动关闭
   drawBatteryIndicator(false);   // 每 5s 刷新电量显示 + BLE 上报
   if (gBalanceDirty) {
     gBalanceDirty = false;

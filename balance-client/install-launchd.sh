@@ -57,6 +57,6 @@ launchctl bootout gui/$UID_NUM/$LABEL 2>/dev/null || true
 launchctl bootstrap gui/$UID_NUM "$PLIST"
 launchctl enable gui/$UID_NUM/$LABEL
 
-echo "已安装：$PLIST（每 5 分钟自动推送一次）"
+echo "已安装：${PLIST}（每 5 分钟自动推送一次）"
 echo "查看日志：tail -f $LOG_OUT"
 echo "卸载：launchctl bootout gui/$UID_NUM/$LABEL && rm $PLIST"
