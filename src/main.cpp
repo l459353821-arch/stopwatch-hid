@@ -9,8 +9,9 @@
  *   - 完全移除原生 USB 麦克风（本固件不做任何音频传输）。
  *   - 保留：三扇区饼图触摸（复制/删除/粘贴）+ A/B 物理按键。
  *
- * 饼图触摸：复制(Cmd+C) / 删除(Backspace 按住连删) / 粘贴(Cmd+V)
+ * 饼图触摸：复制(Cmd+C) / 删除(Backspace 按住连删) / 粘贴(Cmd+V)，命中即马达震动
  * 物理按键：BtnA 按住=右Option(松开释放)、BtnB 单击=回车、双击=Shift+回车、长按=撤销(Cmd+Z)
+ * 震动马达：M5.Power.setVibration 驱动 M5IOE1 PWM1->IO9/G9，需先开 3V3_L3B 电源轨(G8)
  */
 #include <Arduino.h>
 #include <M5Unified.h>
@@ -86,10 +87,9 @@ constexpr uint32_t kDoubleClickWindowMs = 300;  // B 键双击判定窗口（两
 constexpr uint32_t kBatteryRefreshMs = 5000;  // 电量刷新间隔（ms）
 constexpr uint8_t  kLowBatteryLevel  = 20;    // 低电量阈值（%）
 
-// 触摸震动反馈（M5IOE1 PWM1 → IO9/G9 马达，M5.Power.setVibration 驱动）
-constexpr uint8_t  kBuzzLevel   = 220;  // 震动强度 0-255
-constexpr uint32_t kBuzzMs      = 30;   // 触摸命中震动时长
-constexpr uint32_t kBuzzHoldMs  = 60;   // 蓝色进入连删模式的震动时长
+// 触摸震动反馈（M5IOE1 PWM1 → IO9/G9 马达 + 3V3_L3B 电源轨，方案参考 codex-micro-stopwatch）
+constexpr uint8_t  kHapticIntensity = 176;  // 马达启动阈值约 56% 占空比，176 手感稳定
+constexpr uint8_t  kL3bEnIndex      = 7;    // M5IOE1 G8 (PYB_L3B_EN) 零基索引：马达供电轨使能
 
 // ===================== 物理按键（StopWatch：BtnA=GPIO2，BtnB=GPIO1，低电平按下） =====================
 constexpr int     kBtnAPin   = 2;
@@ -180,21 +180,42 @@ static void releaseOption() {
   optionHeld = false;
 }
 
-// ===================== 触摸震动反馈（M5IOE1 PWM1 → IO9/G9 马达） =====================
-static bool     motorOn      = false;
-static uint32_t motorUntilMs = 0;
+// ===================== 震动马达（M5IOE1 PWM1 → IO9/G9 + L3B 电源轨） =====================
+// 震动由 M5Unified 内置 M5.Power.setVibration() 驱动（内部写 M5IOE1 PWM1 -> IO9/G9）;
+// 但马达供电来自 3V3_L3B 电源轨（M5IOE1 G8/PYB_L3B_EN，零基索引 7），必须先打开电源轨，
+// 否则马达无电不转。（参考 codex-micro-stopwatch, MIT）
+static bool     gIoeReady       = false;
+static bool     gVibrateActive  = false;
+static uint32_t gVibrateUntilMs = 0;
 
-static void buzzMotor(uint8_t level, uint32_t durationMs) {
-  if (M5.getBoard() != m5::board_t::board_M5StopWatch) return;  // 仅 StopWatch 有马达
-  M5.Power.setVibration(level);
-  motorUntilMs = millis() + durationMs;
-  motorOn = true;
+// 打开/关闭 3V3_L3B 电源轨（G8/PYB_L3B_EN）：推挽输出，置高 = 供电
+static void setL3bRail(bool enabled) {
+  auto& ioe1 = M5.getIOExpander(0);
+  ioe1.setHighImpedance(kL3bEnIndex, false);   // 推挽输出（关键：否则 EN 浮空）
+  ioe1.setDirection(kL3bEnIndex, true);
+  ioe1.digitalWrite(kL3bEnIndex, enabled);
 }
-static void updateMotorBuzz() {
-  if (motorOn && (int32_t)(millis() - motorUntilMs) >= 0) {
-    motorOn = false;
-    M5.Power.setVibration(0);
-  }
+
+static void vibrateInit() {
+  if (M5.getBoard() != m5::board_t::board_M5StopWatch) return;  // 仅 StopWatch 有马达
+  setL3bRail(true);               // 开 L3B 电源轨，马达才有供电
+  M5.Power.setVibration(0);       // 初始关闭 PWM
+  gIoeReady = true;
+  Serial.println("[VIB] motor ready (setVibration + L3B rail ON)");
+}
+
+// 触发一次震动（非阻塞，由 updateVibrator() 到时自动关闭）
+static void vibrate(uint8_t strength, uint32_t durationMs) {
+  if (!gIoeReady) return;
+  gVibrateUntilMs = millis() + durationMs;
+  gVibrateActive  = true;
+  M5.Power.setVibration(strength);
+}
+
+static void updateVibrator() {
+  if (!gVibrateActive || (int32_t)(millis() - gVibrateUntilMs) < 0) return;
+  gVibrateActive = false;
+  M5.Power.setVibration(0);
 }
 
 // ===================== 饼图绘制 =====================
@@ -283,7 +304,7 @@ static void handleTouch() {
       highlight = sector;
       highlightSetMs = now;
       drawPie(sector);
-      buzzMotor(kBuzzLevel, kBuzzMs);
+      vibrate(kHapticIntensity, 25);   // 命中扇区：短震动反馈
     }
 
     if (sector == 1) {
@@ -294,9 +315,10 @@ static void handleTouch() {
         highlight = 1;   // 长按期间高亮保持
         drawPie(1);
         tapBackspace();
-        buzzMotor(kBuzzLevel, kBuzzHoldMs);   // 进入连删模式的提示震动
+        vibrate(kHapticIntensity, 20);   // 进入连删模式：提示震动
       }
       if (blueLongPress && (now - blueRepeatLastMs) >= kBlueRepeatMs) {
+        vibrate(kHapticIntensity, 12);   // 连删节拍震动
         tapBackspace();
         blueRepeatLastMs = now;
       }
@@ -313,6 +335,7 @@ static void handleTouch() {
       uint32_t held = now - touchStartMs;
       // 蓝色单击：抬手且未到长按阈值 → 发一次退格
       if (touchSector == 1 && !blueLongPress && held >= kTouchDebounceMs && held < kBlueHoldMs) {
+        vibrate(kHapticIntensity, 20);   // 蓝色单击抬手：反馈
         tapBackspace();
       }
       touchActive = false;
@@ -501,6 +524,14 @@ void setup() {
   M5.Display.setRotation(0);
   M5.Display.setBrightness(120);
 
+  // 震动马达初始化：打开 3V3_L3B 电源轨（需在 M5.begin 之后，I2C 就绪）
+  vibrateInit();
+  // 开机自检震动 ×2（各 150ms），方便体感确认马达正常
+  vibrate(kHapticIntensity, 150);
+  delay(300);
+  vibrate(kHapticIntensity, 150);
+  delay(150);
+
   kCx = M5.Display.width() / 2;
   kCy = M5.Display.height() / 2;
   kRadius = (int32_t)((float)min(M5.Display.width(), M5.Display.height()) * 165.0f / 466.0f);
@@ -540,7 +571,7 @@ void loop() {
 
   handleButtons();
   handleTouch();
-  updateMotorBuzz();             // 触摸震动到时自动关闭
+  updateVibrator();              // 震动到时自动关闭
   drawBatteryIndicator(false);   // 每 5s 刷新电量显示 + BLE 上报
   if (gBalanceDirty) {
     gBalanceDirty = false;
